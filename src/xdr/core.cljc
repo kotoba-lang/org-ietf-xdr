@@ -112,6 +112,77 @@
   (let [v (get-u32 bs pos)]
     (if (>= v 2147483648) (- v 4294967296) v)))
 
+;; ── a hyper is 64 bits wide, on a host that has no such number ────────────
+;;
+;; The JVM has `long`, which is exactly the wire's eight bytes, and
+;; `clojure.lang.BigInt` for the one unsigned range a long cannot hold
+;; (2^63 and above). ClojureScript has doubles: exact only to 2^53, and
+;; every bitwise operator truncates to 32 bits first. Neither is a hyper.
+;;
+;; The one primitive on that side with the right semantics is `BigInt`, and
+;; that is what this library already does everywhere a 64-bit value has to
+;; survive a wire: `blake2.word` ("a `long` on :clj, a `BigInt` on :cljs"),
+;; `kotoba.kir.cljs-i64` ("never a plain cljs number"), and `ipld.value`,
+;; which puts one on a wire with `DataView.setBigInt64`.
+;;
+;; The other approach in this workspace — `io-multiformats` and
+;; `dev-protobuf` refuse anything above 2^53 rather than encode it — is
+;; right for those two and wrong here, and both say so themselves: they
+;; scope the refusal to codecs whose values do not reach 2^53, and both
+;; name the big-integer path as the thing you grow when they do. NFS's
+;; `fileid3`, `cookie3` and `writeverf3` are full-width `uint64` and the
+;; high bit is ordinary in all three. Refusing them on ClojureScript while
+;; the JVM decodes them exactly — which the `+'` below already did — is the
+;; cross-host disagreement `protobuf.wire` calls worse than either answer.
+;;
+;; So on ClojureScript a decoded `hyper`/`uhyper` is ALWAYS a `BigInt`,
+;; never sometimes one. A codec that returned a plain number below 2^53 and
+;; a BigInt above it would work against one NFS server and throw `Cannot
+;; mix BigInt and other types` against the next, and which server you had
+;; is not a property anyone tests for.
+
+#?(:clj (def ^:private u64-modulus 18446744073709551616N))
+
+#?(:cljs
+   (defn- bigint-value? [x]
+     (boolean (and (some? x)
+                   (try (identical? js/BigInt (.-constructor x))
+                        (catch :default _ false))))))
+
+#?(:cljs
+   (defn- ->hyper
+     "A hyper argument as a `BigInt`.
+
+     A plain number is accepted only while it is still exactly itself:
+     past `Number.MAX_SAFE_INTEGER` the caller has already lost the value
+     and we would be encoding a different one, so it is refused rather than
+     written down — the same check `ipld.value` makes before it calls
+     `setBigInt64`."
+     [n]
+     (cond
+       (bigint-value? n) n
+       (and (number? n) (js/Number.isSafeInteger n)) (js/BigInt n)
+       :else (throw (ex-info "xdr: a hyper must be a BigInt or an exactly-representable number"
+                             {:value n})))))
+
+#?(:clj (def ^:private hyper-min -9223372036854775808))
+
+(defn- check-hyper-range!
+  "`hyper` and `unsigned hyper` are the same eight bytes, so this accepts the
+  union of both ranges: -2^63 through 2^64-1.
+
+  Outside it, the low 64 bits are a different number, and every path here
+  used to write them silently — the JVM's `.longValue` truncates and
+  ClojureScript's `BigInt.asUintN` wraps."
+  [n]
+  #?(:clj
+     (when (or (< n hyper-min) (>= n u64-modulus))
+       (throw (ex-info "xdr: hyper out of range" {:value n})))
+     :cljs
+     (when (or (< n (js/BigInt "-9223372036854775808"))
+               (> n (js/BigInt "18446744073709551615")))
+       (throw (ex-info "xdr: hyper out of range" {:value n})))))
+
 (defn- put-64!
   "Both `hyper` and `unsigned hyper`, because on the wire they are the same
   eight bytes and only the reader's interpretation differs.
@@ -120,39 +191,59 @@
   operations is correct for negatives without normalising first — and
   normalising first is what broke: `(+ -2 2^64)` leaves the long range
   entirely. The divide path is kept for the one input a long cannot hold,
-  an unsigned value at or above 2^63, which arrives as a BigInt.
-
-  ClojureScript has doubles, so values beyond 2^53 are not representable
-  there at all; that is a limit of the host, stated rather than hidden."
+  an unsigned value at or above 2^63, which arrives as a BigInt."
   [s n]
   #?(:clj
-     (if (instance? clojure.lang.BigInt n)
-       (let [hi (biginteger (quot n 4294967296))
-             lo (biginteger (rem n 4294967296))]
-         (-> s (put-u32! (.longValue hi)) (put-u32! (.longValue lo))))
-       (let [n (long n)]
-         (-> s
-             (put-u32! (bit-and (unsigned-bit-shift-right n 32) 0xffffffff))
-             (put-u32! (bit-and n 0xffffffff)))))
+     (do
+       (check-hyper-range! n)
+       (if (instance? clojure.lang.BigInt n)
+         ;; `quot`/`rem` truncate toward zero, so a NEGATIVE BigInt would split
+         ;; into halves that are each negative and reassemble as a different
+         ;; number — `-2N` encoded as `00000000fffffffe` where `-2` encoded
+         ;; as `fffffffffffffffe`. Normalising into the unsigned range first
+         ;; is safe here precisely because BigInt has no ceiling to leave.
+         (let [m (if (neg? n) (+' n u64-modulus) n)
+               hi (biginteger (quot m 4294967296))
+               lo (biginteger (rem m 4294967296))]
+           (-> s (put-u32! (.longValue hi)) (put-u32! (.longValue lo))))
+         (let [n (long n)]
+           (-> s
+               (put-u32! (bit-and (unsigned-bit-shift-right n 32) 0xffffffff))
+               (put-u32! (bit-and n 0xffffffff))))))
      :cljs
-     (let [neg? (neg? n)
-           m (if neg? (+ n 18446744073709551616) n)
-           hi (Math/floor (/ m 4294967296))
-           lo (- m (* hi 4294967296))]
+     (let [b (->hyper n)
+           _ (check-hyper-range! b)
+           ;; Two's complement, exactly: a negative hyper and the unsigned
+           ;; hyper 2^64 above it are the same eight bytes by definition.
+           m (js/BigInt.asUintN 64 b)
+           hi (js/Number (/ m (js/BigInt 4294967296)))
+           lo (js/Number (js/BigInt.asUintN 32 m))]
        (-> s (put-u32! hi) (put-u32! lo)))))
+
+#?(:cljs
+   (defn- get-u64-bigint [bs pos]
+     ;; Both halves are below 2^32, so each is an exact `Number` before it
+     ;; becomes a BigInt; the multiply that would have lost the top bits
+     ;; happens in BigInt, where it cannot.
+     (+ (* (js/BigInt (get-u32 bs pos)) (js/BigInt 4294967296))
+        (js/BigInt (get-u32 bs (+ pos 4))))))
 
 (defn- get-i64 [bs pos]
   #?(:clj (bit-or (bit-shift-left (long (get-u32 bs pos)) 32)
                   (long (get-u32 bs (+ pos 4))))
-     :cljs (let [v (+ (* (get-u32 bs pos) 4294967296) (get-u32 bs (+ pos 4)))]
-             (if (>= v 9223372036854775808) (- v 18446744073709551616) v))))
+     :cljs (js/BigInt.asIntN 64 (get-u64-bigint bs pos))))
 
 (defn- get-u64 [bs pos]
-  ;; Auto-promoting arithmetic: an unsigned hyper can exceed Long/MAX_VALUE,
-  ;; and `*` throws there rather than wrapping. Throwing is right; promoting
-  ;; is righter, because the value is representable and the caller asked for
-  ;; it unsigned.
-  (+' (*' (get-u32 bs pos) 4294967296) (get-u32 bs (+ pos 4))))
+  ;; JVM: auto-promoting arithmetic, because an unsigned hyper can exceed
+  ;; Long/MAX_VALUE and `*` throws there rather than wrapping. Throwing is
+  ;; right; promoting is righter, because the value is representable and the
+  ;; caller asked for it unsigned.
+  ;;
+  ;; ClojureScript has no `+'`/`*'` at all — they are not slower there, they
+  ;; do not exist — which is why this namespace would not even load. BigInt
+  ;; is the promotion.
+  #?(:clj (+' (*' (get-u32 bs pos) 4294967296) (get-u32 bs (+ pos 4)))
+     :cljs (get-u64-bigint bs pos)))
 
 (defn- padding [n] (mod (- 4 (mod n 4)) 4))
 

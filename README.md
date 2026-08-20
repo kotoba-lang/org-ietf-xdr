@@ -38,10 +38,35 @@ platform bytes inside decoded values rather than becoming integer vectors —
 a 64 KiB NFS READ through a boxed vector is the difference between a
 filesystem and a demonstration.
 
+## Hyper
+
+`hyper` and `unsigned hyper` are 64 bits wide, and one of the two hosts has no
+number of that size. A decoded hyper is therefore:
+
+- **JVM** — a `long`, or a `clojure.lang.BigInt` for the unsigned range at
+  2^63 and above, which is what `+'` already produced.
+- **ClojureScript** — a JavaScript `BigInt`, always. Not a plain number below
+  2^53 and a `BigInt` above it: NFS's `fileid3`, `cookie3` and `writeverf3`
+  are full-width `uint64` and the high bit is ordinary in all three, so a
+  magnitude-dependent type is code that works against one server and throws
+  `Cannot mix BigInt and other types` against the next.
+
+`encode` takes either a `BigInt` or a plain number on ClojureScript, but
+refuses a plain number past `Number.MAX_SAFE_INTEGER` — at that point the
+caller has already lost the value and the bytes written would be some other
+number's. Anything outside -2^63 … 2^64-1 is refused on both hosts rather
+than truncated to its low 64 bits.
+
+This is the same answer `blake2.word`, `kotoba.kir.cljs-i64` and `ipld.value`
+give. `io-multiformats` and `dev-protobuf` give a different one — refuse
+everything above 2^53 — and both scope it to codecs whose values do not reach
+there, which XDR's does.
+
 ## Test
 
 ```bash
-clojure -M:test
+clojure -M:test                          # JVM
+nbb --classpath src:test run-tests.cljs  # ClojureScript
 ```
 
 Expectations are byte strings produced independently of the encoder under
