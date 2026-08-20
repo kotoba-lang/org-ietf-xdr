@@ -13,6 +13,20 @@
              #?(:clj (Integer/parseInt t 16) :cljs (js/parseInt t 16))))
          (partition 2 s))))
 
+(defn- h
+  "The platform's exact 64-bit value for the decimal string `s`.
+
+  Written as a string because neither runtime can be trusted with the
+  literal: ClojureScript reads `9007199254740993` as 9007199254740992 (it is
+  a double), and the JVM rejects `18446744073709551615` outright unless it
+  is tagged `N`. The result is what each host's decoder returns for those
+  bytes — a `long` on the JVM while one fits, `clojure.lang.BigInt` above
+  that, and always a `BigInt` on ClojureScript."
+  [s]
+  #?(:clj (let [b (bigint (java.math.BigInteger. ^String s))]
+            (if (and (>= b Long/MIN_VALUE) (<= b Long/MAX_VALUE)) (long b) b))
+     :cljs (js/BigInt s)))
+
 (defn- round [schema value]
   (xdr/decode-value schema (xdr/encode schema value)))
 
@@ -25,8 +39,8 @@
            [:uint 4294967295 "ffffffff"]
            [:bool true "00000001"]
            [:bool false "00000000"]
-           [:uhyper 8589934599 "0000000200000007"]
-           [:hyper -2 "fffffffffffffffe"]]]
+           [:uhyper (h "8589934599") "0000000200000007"]
+           [:hyper (h "-2") "fffffffffffffffe"]]]
     (testing (str schema " " value)
       (is (= hex (xdr/hexify (xdr/encode schema value))))
       (is (= value (xdr/decode-value schema (unhex hex)))))))
@@ -75,8 +89,10 @@
 (deftest unions-select-an-arm-and-void-is-an-arm
   (let [schema [:union [:enum] {0 [:struct [:size [:uhyper]]]
                                 :default :void}]]
-    (is (= {:disc 0 :value {:size 5}}
-           (round schema {:disc 0 :value {:size 5}})))
+    (is (= {:disc 0 :value {:size (h "5")}}
+           (round schema {:disc 0 :value {:size (h "5")}}))
+        "a uhyper is a 64-bit value wherever it appears, so it comes back as
+         the hosts exact 64-bit type here too, not only at the top level")
     (is (= {:disc 13 :value nil}
            (round schema {:disc 13 :value nil})))
     (is (= "0000000d" (xdr/hexify (xdr/encode schema {:disc 13 :value nil})))
@@ -111,5 +127,80 @@
 
 (deftest large-offsets-survive-the-32-bit-boundary
   (testing "file offsets above 4 GiB — where a 32-bit shift silently wraps"
-    (doseq [n [4294967296 4294967297 8589934592 1099511627776]]
+    (doseq [d ["4294967296" "4294967297" "8589934592" "1099511627776"]
+            :let [n (h d)]]
       (is (= n (round [:uhyper] n))))))
+
+;; ── the 64-bit boundary, which is where ClojureScript goes wrong ──────────
+;;
+;; Every test above this line uses values a JavaScript double happens to
+;; hold exactly, and a codec that rounds every hyper it decodes passes all
+;; of them. These are the values that tell the two apart: 2^53+1 is the
+;; smallest integer a double cannot represent, and it is the first place a
+;; `+`-based decoder answers 9007199254740992 to a question about
+;; 9007199254740993 without saying so.
+;;
+;; The hex strings are the RFC's big-endian eight bytes, computed from the
+;; decimal by hand, not by the encoder under test.
+
+(deftest an-unsigned-hyper-is-exact-to-its-last-bit
+  (doseq [[decimal hex]
+          [["9007199254740992"    "0020000000000000"]  ; 2^53, the last exact double
+           ["9007199254740993"    "0020000000000001"]  ; 2^53+1, the first that is not
+           ["9223372036854775807" "7fffffffffffffff"]  ; 2^63-1, Long/MAX_VALUE
+           ["9223372036854775808" "8000000000000000"]  ; 2^63, where the JVM promotes
+           ["18446744073709551615" "ffffffffffffffff"]] ; 2^64-1
+          :let [n (h decimal)]]
+    (testing (str "uhyper " decimal)
+      (is (= hex (xdr/hexify (xdr/encode [:uhyper] n)))
+          "encoding must emit the bytes of the number it was given")
+      (is (= n (xdr/decode-value [:uhyper] (unhex hex)))
+          "decoding must answer the number those bytes are")
+      (is (= n (round [:uhyper] n))))))
+
+(deftest a-signed-hyper-is-exact-to-its-last-bit
+  (doseq [[decimal hex]
+          [["-1"                   "ffffffffffffffff"]
+           ["-9007199254740993"    "ffdfffffffffffff"]  ; -(2^53+1)
+           ["-9223372036854775808" "8000000000000000"]  ; -2^63
+           ["9223372036854775807"  "7fffffffffffffff"]] ; 2^63-1
+          :let [n (h decimal)]]
+    (testing (str "hyper " decimal)
+      (is (= hex (xdr/hexify (xdr/encode [:hyper] n))))
+      (is (= n (xdr/decode-value [:hyper] (unhex hex))))
+      (is (= n (round [:hyper] n))))))
+
+(deftest the-same-eight-bytes-read-two-ways
+  (testing "hyper and uhyper differ only in interpretation, so the bit
+            pattern that is -1 signed must be 2^64-1 unsigned"
+    (let [bs (xdr/encode [:hyper] (h "-1"))]
+      (is (= "ffffffffffffffff" (xdr/hexify bs)))
+      (is (= (h "18446744073709551615") (xdr/decode-value [:uhyper] bs))))
+    (let [bs (xdr/encode [:uhyper] (h "18446744073709551615"))]
+      (is (= (h "-1") (xdr/decode-value [:hyper] bs))))))
+
+(deftest a-hyper-outside-sixty-four-bits-is-refused-not-truncated
+  (testing "2^64 and below -2^63 have no eight-byte spelling; writing their
+            low bits would be writing a different number"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (xdr/encode [:uhyper] (h "18446744073709551616"))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (xdr/encode [:hyper] (h "-9223372036854775809"))))))
+
+#?(:cljs
+   (deftest a-plain-number-that-has-already-lost-the-value-is-refused
+     (testing "9007199254740993 as a cljs number IS 9007199254740992 before
+               this library ever sees it; encoding it would put the wrong
+               eight bytes on the wire and nothing downstream could tell"
+       (is (thrown? js/Error (xdr/encode [:uhyper] 9007199254740993)))
+       (is (thrown? js/Error (xdr/encode [:uhyper] 1e300)))
+       (testing "but a number still equal to itself is fine"
+         (is (= (h "8589934599") (round [:uhyper] 8589934599)))))))
+
+#?(:clj
+   (deftest a-negative-hyper-encodes-the-same-whichever-integer-type-it-is
+     (testing "`-2` arrives as a Long and `-2N` as a clojure.lang.BigInt;
+               they are the same hyper and must be the same eight bytes"
+       (is (= (xdr/hexify (xdr/encode [:hyper] -2))
+              (xdr/hexify (xdr/encode [:hyper] -2N))
+              "fffffffffffffffe")))))
