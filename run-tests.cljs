@@ -29,7 +29,7 @@
   reports that rather than reporting clean."
   (:require ["node:fs" :as fs]
             ["node:path" :as path]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [cljs.test :as t]
             [xdr.core-test]))
 
