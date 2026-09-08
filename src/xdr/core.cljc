@@ -41,7 +41,7 @@
   READ reply carries up to 64 KiB of file content, and turning that into a
   boxed vector per call is the difference between a filesystem and a
   demonstration."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ── bytes ─────────────────────────────────────────────────────────────────
 
