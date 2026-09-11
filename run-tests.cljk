@@ -1,7 +1,7 @@
 (ns run-tests
   "Run the whole suite under nbb, and EXIT NON-ZERO IF IT IS NOT GREEN.
 
-      nbb --classpath src:test run-tests.cljs
+      nbb --classpath src:test run-tests.cljk
 
   `clojure -M:test` answers for the JVM. Nothing answered for ClojureScript
   until this file existed, and `xdr.core` did not in fact load there at all:
