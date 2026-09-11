@@ -1,9 +1,9 @@
 (ns run-tests
   "Run the whole suite under nbb, and EXIT NON-ZERO IF IT IS NOT GREEN.
 
-      nbb --classpath src:test run-tests.cljk
+      kbb --backend sci --classpath src:test run-tests.cljk
 
-  `clojure -M:test` answers for the JVM. Nothing answered for ClojureScript
+  `kbb -M:test` answers for the JVM. Nothing answered for ClojureScript
   until this file existed, and `xdr.core` did not in fact load there at all:
   `get-u64` was written with `+'` and `*'`, which the JVM has and
   ClojureScript does not have under any name. A `.cljc` extension was the
@@ -17,7 +17,7 @@
 
   ## Why the suite list is compared with the disk
 
-  `clojure -M:test` finds test namespaces by scanning the test path. A
+  `kbb -M:test` finds test namespaces by scanning the test path. A
   ClojureScript runner cannot: the list below is written by hand, so the way
   it breaks is that someone adds `foo_test.cljc` and does not add it here.
   The suite then shrinks and the summary still says no failures.
@@ -77,7 +77,7 @@
       (seq missed)
       (println (str "TEST FILES NOT IN THE SUITE: " (pr-str missed)
                     "\nThe ClojureScript run silently stopped covering them "
-                    "while `clojure -M:test` kept passing.")))
+                    "while `kbb -M:test` kept passing.")))
     (when (zero? (:test m))
       (println "\nNO TESTS RAN — refusing to report a pass."))
     (js/process.exit (if (or (pos? bad) (not looked?) (seq missed) (zero? (:test m)))
