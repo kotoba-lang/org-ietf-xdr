@@ -65,8 +65,8 @@ there, which XDR's does.
 ## Test
 
 ```bash
-clojure -M:test                          # JVM
-nbb --classpath src:test run-tests.cljk  # ClojureScript
+kbb -M:test                          # JVM
+kbb --backend sci --classpath src:test run-tests.cljk  # ClojureScript
 ```
 
 Expectations are byte strings produced independently of the encoder under
