@@ -3,7 +3,7 @@
   big-endian packing plus the RFC's padding rule, written out by hand — not
   by the encoder under test. The stronger oracle arrives one layer up: the
   bytes macOS's own NFS client sends, pinned in `nfs`."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [xdr.core :as xdr]))
 
 (defn- unhex [s]
